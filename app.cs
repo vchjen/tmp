@@ -18,6 +18,9 @@ namespace TrayBalloonAlt
         }
     }
 
+    // Choose a notification type (maps to color + icon)
+    internal enum ToastIcon { None, Info, Warning, Error }
+
     /// <summary> Headless app context with tray + menu + demo timer. </summary>
     internal sealed class TrayAppContext : ApplicationContext
     {
@@ -30,10 +33,14 @@ namespace TrayBalloonAlt
             _toasts = new ToastManager();
 
             var menu = new ContextMenuStrip();
-            menu.Items.Add("Show 10-minute notice", null, (_, __) =>
-                _toasts.Show("Long running task", "This stays for 10 minutes.", TimeSpan.FromMinutes(10)));
-            menu.Items.Add("Show short notice", null, (_, __) =>
-                _toasts.Show("Hello", "I look like a balloon.", TimeSpan.FromSeconds(8)));
+            menu.Items.Add("Info toast", null, (_, __) =>
+                _toasts.Show("Heads up", "This is an informational message.", TimeSpan.FromSeconds(8), ToastIcon.Info));
+            menu.Items.Add("Warning toast", null, (_, __) =>
+                _toasts.Show("Be careful", "Something may need your attention.", TimeSpan.FromSeconds(8), ToastIcon.Warning));
+            menu.Items.Add("Error toast", null, (_, __) =>
+                _toasts.Show("Oops!", "An error occurred running the task.", TimeSpan.FromSeconds(8), ToastIcon.Error));
+            menu.Items.Add("10-minute notice", null, (_, __) =>
+                _toasts.Show("Long running task", "This stays for 10 minutes.", TimeSpan.FromMinutes(10), ToastIcon.Info));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, (_, __) => Exit());
 
@@ -47,7 +54,8 @@ namespace TrayBalloonAlt
 
             // demo toast every 30s
             _demoTimer = new Timer { Interval = 30_000 };
-            _demoTimer.Tick += (_, __) => _toasts.Show("Timer Tick", $"It is {DateTime.Now:T}", TimeSpan.FromSeconds(12));
+            _demoTimer.Tick += (_, __) =>
+                _toasts.Show("Timer Tick", $"It is {DateTime.Now:T}", TimeSpan.FromSeconds(12), ToastIcon.Info);
             _demoTimer.Start();
         }
 
@@ -74,12 +82,12 @@ namespace TrayBalloonAlt
             _ui.CreateControl();
         }
 
-        public void Show(string title, string message, TimeSpan? duration = null)
+        public void Show(string title, string message, TimeSpan? duration = null, ToastIcon icon = ToastIcon.Info)
         {
-            if (_ui.InvokeRequired) { _ui.BeginInvoke((Action)(() => Show(title, message, duration))); return; }
+            if (_ui.InvokeRequired) { _ui.BeginInvoke((Action)(() => Show(title, message, duration, icon))); return; }
 
             var life = duration ?? TimeSpan.FromSeconds(8);
-            var form = new ToastForm(title, message, life);
+            var form = new ToastForm(title, message, life, icon);
             form.FormClosed += (_, __) => { _open.Remove(form); RepositionAll(); };
 
             _open.Add(form);
@@ -125,31 +133,38 @@ namespace TrayBalloonAlt
         }
     }
 
-    /// <summary> Custom balloon form. </summary>
+    /// <summary> Custom balloon form: min/max height, icon, rounded, fade. </summary>
     internal sealed class ToastForm : Form
     {
-        private readonly Label _title;
-        private readonly Label _body;
-        private readonly Panel _header;
-        private readonly Button _closeBtn;
-
-        private readonly Timer _lifeTimer = new();
-        private readonly Timer _fadeTimer = new();
-        private bool _fadingIn = true;
-        private readonly TimeSpan _life;
-
-        // layout constants
+        // Layout constants
         private const int CornerRadius = 12;
         private const int HPAD = 14;
         private const int VPAD = 14;
         private const int HeaderHeight = 28;
         private const int MaxContentWidth = 360;
-        private const int MaxContentHeight = 200;
-        private const int MinWidth = 220;
+        private const int MinContentHeight = 72;   // ~like classic balloon minimum
+        private const int MaxContentHeight = 200;  // clamp tall notifications
+        private const int MinWidth = 240;          // allow room for icon + text
 
-        public ToastForm(string title, string body, TimeSpan life)
+        private readonly Panel _header;
+        private readonly Label _title;
+        private readonly Button _closeBtn;
+
+        private readonly PictureBox _glyph;   // icon
+        private readonly Label _body;
+
+        private readonly Panel _accent;       // colored stripe per icon type
+        private readonly Timer _lifeTimer = new();
+        private readonly Timer _fadeTimer = new();
+        private bool _fadingIn = true;
+        private readonly TimeSpan _life;
+        private readonly ToastIcon _iconKind;
+
+        public ToastForm(string title, string body, TimeSpan life, ToastIcon iconKind)
         {
             _life = life;
+            _iconKind = iconKind;
+
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -158,12 +173,23 @@ namespace TrayBalloonAlt
             KeyPreview = true;
             Opacity = 0;
 
-            _title = new Label { Text = title, Dock = DockStyle.Fill,
-                                 TextAlign = ContentAlignment.MiddleLeft,
-                                 Font = new Font("Segoe UI", 9.5f, FontStyle.SemiBold) };
+            // ===== Header =====
+            _title = new Label
+            {
+                Text = title,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Segoe UI", 9.5f, FontStyle.SemiBold)
+            };
 
-            _closeBtn = new Button { Text = "✕", Dock = DockStyle.Right, Width = 28,
-                                     FlatStyle = FlatStyle.Flat, TabStop = false };
+            _closeBtn = new Button
+            {
+                Text = "✕",
+                Dock = DockStyle.Right,
+                Width = 28,
+                FlatStyle = FlatStyle.Flat,
+                TabStop = false
+            };
             _closeBtn.FlatAppearance.BorderSize = 0;
             _closeBtn.Click += (_, __) => BeginFadeOut();
 
@@ -171,16 +197,42 @@ namespace TrayBalloonAlt
             _header.Controls.Add(_closeBtn);
             _header.Controls.Add(_title);
 
-            _body = new Label { Text = body, Dock = DockStyle.Fill, Padding = new Padding(HPAD, 6, HPAD, VPAD),
-                                Font = new Font("Segoe UI", 9f, FontStyle.Regular) };
+            // ===== Accent stripe =====
+            _accent = new Panel { Dock = DockStyle.Left, Width = 4 };
 
-            Controls.Add(_body);
+            // ===== Body with icon + text =====
+            _glyph = new PictureBox
+            {
+                SizeMode = PictureBoxSizeMode.CenterImage,
+                Dock = DockStyle.Left,
+                Width = 36, // reserve space for 24px glyph + margins
+                Margin = new Padding(HPAD, 0, 6, 0)
+            };
+
+            _body = new Label
+            {
+                Text = body,
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                Padding = new Padding(0, 6, HPAD, VPAD),
+                Font = new Font("Segoe UI", 9f, FontStyle.Regular)
+            };
+
+            var bodyPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(HPAD, 0, 0, 0) };
+            bodyPanel.Controls.Add(_body);
+            bodyPanel.Controls.Add(_glyph);
+
+            Controls.Add(bodyPanel);
             Controls.Add(_header);
+            Controls.Add(_accent);
 
+            // Size to content and theme
             SizeToContent();
+            ApplyTheme();
             UpdateRoundedRegion();
             SizeChanged += (_, __) => UpdateRoundedRegion();
 
+            // Timers
             _lifeTimer.Interval = (int)Math.Clamp(_life.TotalMilliseconds, 1000, int.MaxValue);
             _lifeTimer.Tick += (_, __) => BeginFadeOut();
 
@@ -199,17 +251,13 @@ namespace TrayBalloonAlt
                 }
             };
 
-            Load += (_, __) =>
-            {
-                ApplyTheme();
-                _fadingIn = true;
-                _fadeTimer.Start();
-            };
+            Load += (_, __) => { _fadingIn = true; _fadeTimer.Start(); };
 
+            // interactions
             Cursor = Cursors.Hand;
             Click += (_, __) => BeginFadeOut();
             _title.Click += (_, __) => BeginFadeOut();
-            _body.Click += (_, __) => BeginFadeOut();
+            _body.Click  += (_, __) => BeginFadeOut();
             KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) BeginFadeOut(); };
             Resize += (_, __) => Invalidate();
             Paint += (_, __) => DrawBorder();
@@ -217,30 +265,80 @@ namespace TrayBalloonAlt
 
         private void SizeToContent()
         {
+            // measure title (single line) and body (wrapped)
             var titleSize = TextRenderer.MeasureText(_title.Text, _title.Font, new Size(MaxContentWidth, int.MaxValue),
-                                                     TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+                TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+
             var bodySize = TextRenderer.MeasureText(_body.Text, _body.Font, new Size(MaxContentWidth, int.MaxValue),
-                                                    TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+                TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
 
             int contentWidth = Math.Max(titleSize.Width, bodySize.Width);
-            int finalWidth = Math.Max(MinWidth, Math.Min(contentWidth + HPAD * 2, MaxContentWidth + HPAD * 2));
-            int bodyHeight = Math.Min(bodySize.Height, MaxContentHeight);
+            int finalWidth = Math.Max(MinWidth, Math.Min(contentWidth + HPAD * 2, MaxContentWidth + HPAD * 2 + _glyph.Width));
 
+            // clamp body height between min and max
+            int bodyHeight = Math.Max(MinContentHeight, Math.Min(bodySize.Height, MaxContentHeight));
             int finalHeight = HeaderHeight + 6 + bodyHeight + VPAD;
+
             ClientSize = new Size(finalWidth, finalHeight);
         }
 
         private void ApplyTheme()
         {
             bool dark = TaskbarInfo.IsDarkTheme();
+
+            // window colors
             BackColor = dark ? Color.FromArgb(32, 32, 32) : Color.White;
+            _header.BackColor = dark ? Color.FromArgb(40, 40, 40) : Color.FromArgb(245, 245, 245);
             _title.ForeColor = dark ? Color.White : Color.Black;
             _body.ForeColor = dark ? Color.Gainsboro : Color.Black;
-            _header.BackColor = dark ? Color.FromArgb(40, 40, 40) : Color.FromArgb(245, 245, 245);
 
+            // close button states
             _closeBtn.ForeColor = dark ? Color.Gainsboro : Color.Black;
             _closeBtn.FlatAppearance.MouseOverBackColor = dark ? Color.FromArgb(58, 58, 58) : Color.FromArgb(230, 230, 230);
             _closeBtn.FlatAppearance.MouseDownBackColor = dark ? Color.FromArgb(76, 76, 76) : Color.FromArgb(210, 210, 210);
+
+            // icon + accent per type
+            Color accent;
+            Icon sysIcon;
+            switch (_iconKind)
+            {
+                default:
+                case ToastIcon.None:
+                    accent = dark ? Color.FromArgb(80, 80, 80) : Color.FromArgb(210, 210, 210);
+                    sysIcon = null;
+                    break;
+                case ToastIcon.Info:
+                    accent = Color.FromArgb(0, 120, 215); // Win blue-ish
+                    sysIcon = SystemIcons.Information;
+                    break;
+                case ToastIcon.Warning:
+                    accent = Color.FromArgb(202, 138, 4); // amber
+                    sysIcon = SystemIcons.Warning;
+                    break;
+                case ToastIcon.Error:
+                    accent = Color.FromArgb(200, 40, 40); // red
+                    sysIcon = SystemIcons.Error;
+                    break;
+            }
+            _accent.BackColor = accent;
+
+            if (sysIcon != null)
+            {
+                // render SystemIcon to 24x24 bitmap for consistent sizing
+                _glyph.Image?.Dispose();
+                _glyph.Image = new Bitmap(24, 24);
+                using (var g = Graphics.FromImage(_glyph.Image))
+                {
+                    g.Clear(Color.Transparent);
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.DrawIcon(sysIcon, new Rectangle(0, 0, 24, 24));
+                }
+                _glyph.Visible = true;
+            }
+            else
+            {
+                _glyph.Visible = false;
+            }
         }
 
         private void BeginFadeOut()
@@ -258,97 +356,3 @@ namespace TrayBalloonAlt
             int r = CornerRadius;
             gp.AddArc(rect.X, rect.Y, r, r, 180, 90);
             gp.AddArc(rect.Right - r, rect.Y, r, r, 270, 90);
-            gp.AddArc(rect.Right - r, rect.Bottom - r, r, r, 0, 90);
-            gp.AddArc(rect.X, rect.Bottom - r, r, r, 90, 90);
-            gp.CloseAllFigures();
-            Region = new Region(gp);
-            using var g = CreateGraphics();
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            g.DrawPath(pen, gp);
-        }
-
-        private void UpdateRoundedRegion()
-        {
-            using var gp = new System.Drawing.Drawing2D.GraphicsPath();
-            var rect = new Rectangle(0, 0, Width, Height);
-            int r = CornerRadius;
-            gp.AddArc(rect.X, rect.Y, r, r, 180, 90);
-            gp.AddArc(rect.Right - r, rect.Y, r, r, 270, 90);
-            gp.AddArc(rect.Right - r, rect.Bottom - r, r, r, 0, 90);
-            gp.AddArc(rect.X, rect.Bottom - r, r, r, 90, 90);
-            gp.CloseAllFigures();
-            Region = new Region(gp);
-        }
-
-        protected override CreateParams CreateParams
-        {
-            get
-            {
-                var cp = base.CreateParams;
-                cp.ExStyle |= 0x80;
-                cp.ExStyle |= 0x00080000;
-                cp.ClassStyle |= 0x20000;
-                return cp;
-            }
-        }
-    }
-
-    /// <summary> Taskbar info helper. </summary>
-    internal static class TaskbarInfo
-    {
-        public enum TaskbarEdge { Bottom, Top, Left, Right }
-        public static TaskbarEdge Edge { get; private set; } = TaskbarEdge.Bottom;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct APPBARDATA
-        {
-            public uint cbSize;
-            public IntPtr hWnd;
-            public uint uCallbackMessage;
-            public uint uEdge;
-            public RECT rc;
-            public int lParam;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct RECT { public int left, top, right, bottom; }
-
-        [DllImport("shell32.dll")] private static extern uint SHAppBarMessage(uint dwMessage, ref APPBARDATA pData);
-        private const uint ABM_GETTASKBARPOS = 0x00000005;
-
-        public static Point GetTrayAnchor()
-        {
-            var abd = new APPBARDATA { cbSize = (uint)Marshal.SizeOf<APPBARDATA>() };
-            if (SHAppBarMessage(ABM_GETTASKBARPOS, ref abd) != 0)
-            {
-                Edge = (TaskbarEdge)abd.uEdge;
-                var r = abd.rc;
-                return Edge switch
-                {
-                    TaskbarEdge.Bottom => new Point(r.right - 8, r.top - 8),
-                    TaskbarEdge.Top    => new Point(r.right - 8, r.bottom + 8),
-                    TaskbarEdge.Left   => new Point(r.right + 8, r.bottom - 8),
-                    TaskbarEdge.Right  => new Point(r.left - 8, r.bottom - 8),
-                    _ => new Point(Screen.PrimaryScreen.WorkingArea.Right - 8,
-                                   Screen.PrimaryScreen.WorkingArea.Bottom - 8)
-                };
-            }
-            var wa = Screen.PrimaryScreen.WorkingArea;
-            Edge = TaskbarEdge.Bottom;
-            return new Point(wa.Right - 8, wa.Bottom - 8);
-        }
-
-        public static bool IsDarkTheme()
-        {
-            try
-            {
-                using var key = Registry.CurrentUser.OpenSubKey(
-                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
-                var val = key?.GetValue("SystemUsesLightTheme");
-                if (val is int i) return i == 0;
-            }
-            catch { }
-            return false;
-        }
-    }
-}
