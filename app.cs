@@ -12,19 +12,13 @@ namespace TrayBalloonAlt
         [STAThread]
         static void Main()
         {
-            // Surface errors if something goes wrong in timers/threads
-            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-            Application.ThreadException += (s, e) => MessageBox.Show(e.Exception.ToString(), "UI Error");
-            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
-                MessageBox.Show(e.ExceptionObject?.ToString() ?? "Unknown", "Non-UI Error");
-
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new TrayAppContext()); // KEEP MESSAGE LOOP ALIVE
+            Application.Run(new TrayAppContext());
         }
     }
 
-    /// <summary> Headless app context with tray icon + menu and a demo timer. </summary>
+    /// <summary> Headless app context with tray + menu + demo timer. </summary>
     internal sealed class TrayAppContext : ApplicationContext
     {
         private readonly NotifyIcon _tray;
@@ -33,19 +27,13 @@ namespace TrayBalloonAlt
 
         public TrayAppContext()
         {
-            _toasts = new ToastManager(); // constructed on UI thread
+            _toasts = new ToastManager();
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("Show 10-minute notice", null, (_, __) =>
-                _toasts.Show("Long running task", "I will stay here for 10 minutes.", TimeSpan.FromMinutes(10)));
+                _toasts.Show("Long running task", "This stays for 10 minutes.", TimeSpan.FromMinutes(10)));
             menu.Items.Add("Show short notice", null, (_, __) =>
-                _toasts.Show("Hello", "I look like a balloon, but I’m 100% yours.", TimeSpan.FromSeconds(8)));
-            menu.Items.Add("Show centered (debug)", null, (_, __) =>
-            {
-                var screen = Screen.PrimaryScreen.WorkingArea;
-                var center = new Point(screen.Left + screen.Width / 2 - 160, screen.Top + screen.Height / 2 - 60);
-                _toasts.ShowAt("Centered Test", "If you see this, tray positioning was the issue.", TimeSpan.FromSeconds(10), center);
-            });
+                _toasts.Show("Hello", "I look like a balloon.", TimeSpan.FromSeconds(8)));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, (_, __) => Exit());
 
@@ -57,7 +45,7 @@ namespace TrayBalloonAlt
                 ContextMenuStrip = menu
             };
 
-            // Demo: toast every 30s so you can see it working
+            // demo toast every 30s
             _demoTimer = new Timer { Interval = 30_000 };
             _demoTimer.Tick += (_, __) => _toasts.Show("Timer Tick", $"It is {DateTime.Now:T}", TimeSpan.FromSeconds(12));
             _demoTimer.Start();
@@ -70,42 +58,25 @@ namespace TrayBalloonAlt
             _tray.Visible = false;
             _tray.Dispose();
             _demoTimer.Dispose();
-            ExitThread(); // ends Application.Run
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                _toasts?.Dispose();
-                _tray?.Dispose();
-                _demoTimer?.Dispose();
-            }
-            base.Dispose(disposing);
+            ExitThread();
         }
     }
 
-    /// <summary>
-    /// Manages showing stacked toast windows near the system tray; marshals to UI thread.
-    /// </summary>
+    /// <summary> Manages toast popups; ensures UI-thread marshaling. </summary>
     internal sealed class ToastManager : IDisposable
     {
         private readonly List<ToastForm> _open = new();
-        private readonly Control _ui; // hidden control to marshal to UI thread
+        private readonly Control _ui;
 
         public ToastManager()
         {
             _ui = new Control();
-            _ui.CreateControl(); // binds to the UI thread that created ToastManager
+            _ui.CreateControl();
         }
 
         public void Show(string title, string message, TimeSpan? duration = null)
         {
-            if (_ui.InvokeRequired)
-            {
-                _ui.BeginInvoke((Action)(() => Show(title, message, duration)));
-                return;
-            }
+            if (_ui.InvokeRequired) { _ui.BeginInvoke((Action)(() => Show(title, message, duration))); return; }
 
             var life = duration ?? TimeSpan.FromSeconds(8);
             var form = new ToastForm(title, message, life);
@@ -113,28 +84,6 @@ namespace TrayBalloonAlt
 
             _open.Add(form);
             RepositionAll();
-
-            form.Show();        // modeless
-            form.BringToFront();
-        }
-
-        public void ShowAt(string title, string message, TimeSpan? duration, Point location)
-        {
-            if (_ui.InvokeRequired)
-            {
-                _ui.BeginInvoke((Action)(() => ShowAt(title, message, duration, location)));
-                return;
-            }
-
-            var life = duration ?? TimeSpan.FromSeconds(8);
-            var form = new ToastForm(title, message, life)
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = location
-            };
-            form.FormClosed += (_, __) => { _open.Remove(form); RepositionAll(); };
-
-            _open.Add(form);
             form.Show();
             form.BringToFront();
         }
@@ -152,7 +101,6 @@ namespace TrayBalloonAlt
                 var size = f.Size;
                 var target = new Point(basePoint.X - size.Width, y - size.Height);
 
-                // Clamp to the screen containing the tray point (avoid off-screen)
                 var scr = Screen.FromPoint(basePoint);
                 var wa = scr.WorkingArea;
                 target.X = Math.Max(wa.Left, Math.Min(target.X, wa.Right - size.Width));
@@ -160,7 +108,7 @@ namespace TrayBalloonAlt
 
                 f.StartPosition = FormStartPosition.Manual;
                 f.Location = target;
-                y = f.Top - margin; // stack upwards
+                y = f.Top - margin;
             }
         }
 
@@ -171,113 +119,86 @@ namespace TrayBalloonAlt
                 if (_ui.IsHandleCreated)
                     _ui.BeginInvoke((Action)(() => _open.ForEach(f => { if (!f.IsDisposed) f.Close(); })));
             }
-            catch { /* ignore on shutdown */ }
+            catch { }
             _open.Clear();
             _ui.Dispose();
         }
     }
 
-    /// <summary>
-    /// The custom “balloon” popup. Borderless, rounded, fade in/out, click-to-dismiss.
-    /// </summary>
+    /// <summary> Custom balloon form. </summary>
     internal sealed class ToastForm : Form
     {
         private readonly Label _title;
         private readonly Label _body;
+        private readonly Panel _header;
+        private readonly Button _closeBtn;
+
         private readonly Timer _lifeTimer = new();
         private readonly Timer _fadeTimer = new();
         private bool _fadingIn = true;
         private readonly TimeSpan _life;
 
+        // layout constants
+        private const int CornerRadius = 12;
+        private const int HPAD = 14;
+        private const int VPAD = 14;
+        private const int HeaderHeight = 28;
+        private const int MaxContentWidth = 360;
+        private const int MaxContentHeight = 200;
+        private const int MinWidth = 220;
+
         public ToastForm(string title, string body, TimeSpan life)
         {
             _life = life;
-
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
             TopMost = true;
             DoubleBuffered = true;
-            Opacity = 0; // start transparent, fade in
-            BackColor = Color.White;
-            Padding = new Padding(14);
-            MinimumSize = new Size(280, 88);
+            KeyPreview = true;
+            Opacity = 0;
 
-            // Content
-            _title = new Label
-            {
-                Text = title,
-                AutoSize = false,
-                Dock = DockStyle.Top,
-                Height = 22,
-                Font = new Font(SystemFonts.CaptionFont.FontFamily, 10f, FontStyle.Bold),
-                TextAlign = ContentAlignment.MiddleLeft
-            };
-            _body = new Label
-            {
-                Text = body,
-                AutoSize = false,
-                Dock = DockStyle.Fill,
-                Font = new Font(SystemFonts.CaptionFont.FontFamily, 9f, FontStyle.Regular),
-                TextAlign = ContentAlignment.TopLeft
-            };
+            _title = new Label { Text = title, Dock = DockStyle.Fill,
+                                 TextAlign = ContentAlignment.MiddleLeft,
+                                 Font = new Font("Segoe UI", 9.5f, FontStyle.SemiBold) };
 
-            var closeBtn = new Button
-            {
-                Text = "×",
-                AutoSize = false,
-                FlatStyle = FlatStyle.Flat,
-                Width = 28,
-                Height = 22,
-                Dock = DockStyle.Right,
-                TabStop = false
-            };
-            closeBtn.FlatAppearance.BorderSize = 0;
-            closeBtn.Click += (_, __) => BeginFadeOut();
+            _closeBtn = new Button { Text = "✕", Dock = DockStyle.Right, Width = 28,
+                                     FlatStyle = FlatStyle.Flat, TabStop = false };
+            _closeBtn.FlatAppearance.BorderSize = 0;
+            _closeBtn.Click += (_, __) => BeginFadeOut();
 
-            var header = new Panel { Dock = DockStyle.Top, Height = 22 };
-            header.Controls.Add(closeBtn);
-            header.Controls.Add(_title);
+            _header = new Panel { Dock = DockStyle.Top, Height = HeaderHeight, Padding = new Padding(HPAD, 0, HPAD, 0) };
+            _header.Controls.Add(_closeBtn);
+            _header.Controls.Add(_title);
+
+            _body = new Label { Text = body, Dock = DockStyle.Fill, Padding = new Padding(HPAD, 6, HPAD, VPAD),
+                                Font = new Font("Segoe UI", 9f, FontStyle.Regular) };
 
             Controls.Add(_body);
-            Controls.Add(header);
+            Controls.Add(_header);
 
-            // Rounded corners (updated on resize)
-            Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, 16, 16));
-            SizeChanged += (_, __) =>
-            {
-                try
-                {
-                    Region?.Dispose();
-                    Region = Region.FromHrgn(CreateRoundRectRgn(0, 0, Width, Height, 16, 16));
-                }
-                catch { }
-            };
+            SizeToContent();
+            UpdateRoundedRegion();
+            SizeChanged += (_, __) => UpdateRoundedRegion();
 
-            // Timers
             _lifeTimer.Interval = (int)Math.Clamp(_life.TotalMilliseconds, 1000, int.MaxValue);
             _lifeTimer.Tick += (_, __) => BeginFadeOut();
 
-            _fadeTimer.Interval = 16; // ~60fps
+            _fadeTimer.Interval = 16;
             _fadeTimer.Tick += (_, __) =>
             {
-                try
+                if (_fadingIn)
                 {
-                    if (_fadingIn)
-                    {
-                        Opacity = Math.Min(1.0, Opacity + 0.08);
-                        if (Opacity >= 0.999) { _fadeTimer.Stop(); _lifeTimer.Start(); }
-                    }
-                    else
-                    {
-                        Opacity = Math.Max(0.0, Opacity - 0.08);
-                        if (Opacity <= 0.001) Close();
-                    }
+                    Opacity = Math.Min(1.0, Opacity + 0.08);
+                    if (Opacity >= 0.999) { _fadeTimer.Stop(); _lifeTimer.Start(); }
                 }
-                catch { /* never throw out of Tick */ }
+                else
+                {
+                    Opacity = Math.Max(0.0, Opacity - 0.08);
+                    if (Opacity <= 0.001) Close();
+                }
             };
 
-            // Start fade on load (robust even if Shown order varies)
             Load += (_, __) =>
             {
                 ApplyTheme();
@@ -285,33 +206,41 @@ namespace TrayBalloonAlt
                 _fadeTimer.Start();
             };
 
-            // Interactions
             Cursor = Cursors.Hand;
             Click += (_, __) => BeginFadeOut();
             _title.Click += (_, __) => BeginFadeOut();
             _body.Click += (_, __) => BeginFadeOut();
-
             KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) BeginFadeOut(); };
+            Resize += (_, __) => Invalidate();
+            Paint += (_, __) => DrawBorder();
+        }
+
+        private void SizeToContent()
+        {
+            var titleSize = TextRenderer.MeasureText(_title.Text, _title.Font, new Size(MaxContentWidth, int.MaxValue),
+                                                     TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+            var bodySize = TextRenderer.MeasureText(_body.Text, _body.Font, new Size(MaxContentWidth, int.MaxValue),
+                                                    TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+
+            int contentWidth = Math.Max(titleSize.Width, bodySize.Width);
+            int finalWidth = Math.Max(MinWidth, Math.Min(contentWidth + HPAD * 2, MaxContentWidth + HPAD * 2));
+            int bodyHeight = Math.Min(bodySize.Height, MaxContentHeight);
+
+            int finalHeight = HeaderHeight + 6 + bodyHeight + VPAD;
+            ClientSize = new Size(finalWidth, finalHeight);
         }
 
         private void ApplyTheme()
         {
-            try
-            {
-                if (TaskbarInfo.IsDarkTheme())
-                {
-                    BackColor = Color.FromArgb(32, 32, 32);
-                    _title.ForeColor = Color.White;
-                    _body.ForeColor = Color.Gainsboro;
-                }
-                else
-                {
-                    BackColor = Color.White;
-                    _title.ForeColor = Color.Black;
-                    _body.ForeColor = Color.Black;
-                }
-            }
-            catch { }
+            bool dark = TaskbarInfo.IsDarkTheme();
+            BackColor = dark ? Color.FromArgb(32, 32, 32) : Color.White;
+            _title.ForeColor = dark ? Color.White : Color.Black;
+            _body.ForeColor = dark ? Color.Gainsboro : Color.Black;
+            _header.BackColor = dark ? Color.FromArgb(40, 40, 40) : Color.FromArgb(245, 245, 245);
+
+            _closeBtn.ForeColor = dark ? Color.Gainsboro : Color.Black;
+            _closeBtn.FlatAppearance.MouseOverBackColor = dark ? Color.FromArgb(58, 58, 58) : Color.FromArgb(230, 230, 230);
+            _closeBtn.FlatAppearance.MouseDownBackColor = dark ? Color.FromArgb(76, 76, 76) : Color.FromArgb(210, 210, 210);
         }
 
         private void BeginFadeOut()
@@ -321,26 +250,50 @@ namespace TrayBalloonAlt
             if (!_fadeTimer.Enabled) _fadeTimer.Start();
         }
 
+        private void DrawBorder()
+        {
+            using var pen = new Pen(Color.FromArgb(80, 0, 0, 0), 1);
+            var rect = new Rectangle(0, 0, Width - 1, Height - 1);
+            using var gp = new System.Drawing.Drawing2D.GraphicsPath();
+            int r = CornerRadius;
+            gp.AddArc(rect.X, rect.Y, r, r, 180, 90);
+            gp.AddArc(rect.Right - r, rect.Y, r, r, 270, 90);
+            gp.AddArc(rect.Right - r, rect.Bottom - r, r, r, 0, 90);
+            gp.AddArc(rect.X, rect.Bottom - r, r, r, 90, 90);
+            gp.CloseAllFigures();
+            Region = new Region(gp);
+            using var g = CreateGraphics();
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.DrawPath(pen, gp);
+        }
+
+        private void UpdateRoundedRegion()
+        {
+            using var gp = new System.Drawing.Drawing2D.GraphicsPath();
+            var rect = new Rectangle(0, 0, Width, Height);
+            int r = CornerRadius;
+            gp.AddArc(rect.X, rect.Y, r, r, 180, 90);
+            gp.AddArc(rect.Right - r, rect.Y, r, r, 270, 90);
+            gp.AddArc(rect.Right - r, rect.Bottom - r, r, r, 0, 90);
+            gp.AddArc(rect.X, rect.Bottom - r, r, r, 90, 90);
+            gp.CloseAllFigures();
+            Region = new Region(gp);
+        }
+
         protected override CreateParams CreateParams
         {
             get
             {
                 var cp = base.CreateParams;
-                cp.ExStyle |= 0x80;        // WS_EX_TOOLWINDOW (no Alt+Tab)
-                cp.ExStyle |= 0x00080000;  // WS_EX_LAYERED (supports Opacity)
+                cp.ExStyle |= 0x80;
+                cp.ExStyle |= 0x00080000;
+                cp.ClassStyle |= 0x20000;
                 return cp;
             }
         }
-
-        [DllImport("gdi32.dll")]
-        private static extern IntPtr CreateRoundRectRgn(
-            int nLeftRect, int nTopRect, int nRightRect, int nBottomRect,
-            int nWidthEllipse, int nHeightEllipse);
     }
 
-    /// <summary>
-    /// Taskbar info + a reasonable tray anchor using SHAppBarMessage.
-    /// </summary>
+    /// <summary> Taskbar info helper. </summary>
     internal static class TaskbarInfo
     {
         public enum TaskbarEdge { Bottom, Top, Left, Right }
@@ -380,18 +333,17 @@ namespace TrayBalloonAlt
                                    Screen.PrimaryScreen.WorkingArea.Bottom - 8)
                 };
             }
-            // Fallback: bottom-right of primary working area
             var wa = Screen.PrimaryScreen.WorkingArea;
             Edge = TaskbarEdge.Bottom;
             return new Point(wa.Right - 8, wa.Bottom - 8);
         }
 
-        // Very simple theme probe (0 = dark, 1 = light)
         public static bool IsDarkTheme()
         {
             try
             {
-                using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+                using var key = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
                 var val = key?.GetValue("SystemUsesLightTheme");
                 if (val is int i) return i == 0;
             }
